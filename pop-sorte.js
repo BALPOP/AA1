@@ -1231,6 +1231,7 @@ async function confirmEntry() {
         gameId = normalizeGameId(gameIdRaw);
     } catch (error) {
         showToast('❌ ID DE JOGO INVÁLIDO! Digite exatamente 10 dígitos', 'error');
+        isSubmitting = false; // Reset flag on validation error
         return;
     }
 
@@ -1243,6 +1244,7 @@ async function confirmEntry() {
 
         if (!isValidWhatsApp(rawNumber)) {
             showToast('❌ WHATSAPP INVÁLIDO! Digite 10-11 dígitos (ex: 11999887766)', 'error');
+            isSubmitting = false; // Reset flag on validation error
             return;
         }
 
@@ -1252,12 +1254,14 @@ async function confirmEntry() {
 
     if (selectedNumbers.length < 5 || selectedNumbers.length > 20) {
         showToast('❌ SELECIONE ENTRE 5 NÚMEROS!', 'error');
+        isSubmitting = false; // Reset flag on validation error
         return;
     }
 
     const platform = getSelectedPlatform();
     if (!platform) {
         showToast('❌ Selecione uma plataforma antes de confirmar', 'error');
+        isSubmitting = false; // Reset flag on validation error
         return;
     }
 
@@ -1302,31 +1306,79 @@ async function confirmEntry() {
         };
         console.log('📤 REQUEST BODY:', JSON.stringify(requestBody, null, 2));
 
-        const response = await fetch(`${API_BASE_URL}/api/tickets/submit`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(requestBody)
-        });
-
-        const saveResult = await response.json();
+        // ✅ RETRY LOGIC: Handle LOCK_ERROR with automatic retries
+        const MAX_RETRIES = 3;
+        const RETRY_DELAYS = [2000, 4000, 6000]; // Exponential backoff: 2s, 4s, 6s
         
-        // DEBUG: Log server response
-        console.log('📥 SERVER RESPONSE:', {
-            status: response.status,
-            ok: response.ok,
-            success: saveResult.success,
-            error: saveResult.error,
-            fullResponse: saveResult
-        });
+        let lastError = null;
+        let saveResult = null;
+        let bilheteNumber = null;
+        
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                console.log(`🔄 Attempt ${attempt}/${MAX_RETRIES}...`);
+                
+                if (attempt > 1) {
+                    showToast(`🔄 Tentativa ${attempt}/${MAX_RETRIES}... Sistema ocupado, aguarde...`, 'checking');
+                }
+                
+                const response = await fetch(`${API_BASE_URL}/api/tickets/submit`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
 
-        if (!response.ok || !saveResult.success) {
-            console.error('❌ SERVER ERROR:', saveResult);
-            throw new Error(saveResult.error || 'Erro ao salvar');
+                saveResult = await response.json();
+                
+                // DEBUG: Log server response
+                console.log(`📥 SERVER RESPONSE (Attempt ${attempt}):`, {
+                    status: response.status,
+                    ok: response.ok,
+                    success: saveResult.success,
+                    error: saveResult.error,
+                    fullResponse: saveResult
+                });
+
+                if (response.ok && saveResult.success) {
+                    // SUCCESS! Exit retry loop
+                    bilheteNumber = saveResult.bilheteNumber;
+                    console.log(`✅ SUCCESS on attempt ${attempt}!`);
+                    break;
+                }
+                
+                // Check if it's a LOCK_ERROR (retryable)
+                if (saveResult.error === 'LOCK_ERROR' && attempt < MAX_RETRIES) {
+                    console.log(`⚠️ LOCK_ERROR on attempt ${attempt}, will retry in ${RETRY_DELAYS[attempt - 1]}ms...`);
+                    lastError = new Error(saveResult.message || 'Sistema ocupado');
+                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
+                    continue;
+                }
+                
+                // Non-retryable error or max retries reached
+                console.error('❌ SERVER ERROR:', saveResult);
+                throw new Error(saveResult.error || 'Erro ao salvar');
+                
+            } catch (fetchError) {
+                console.error(`❌ Fetch error on attempt ${attempt}:`, fetchError);
+                lastError = fetchError;
+                
+                // If it's a network error and not last attempt, retry
+                if (attempt < MAX_RETRIES && !fetchError.message.includes('LOCK_ERROR')) {
+                    console.log(`⚠️ Network error, will retry in ${RETRY_DELAYS[attempt - 1]}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt - 1]));
+                    continue;
+                }
+                
+                throw fetchError;
+            }
         }
-
-        const bilheteNumber = saveResult.bilheteNumber;
+        
+        // If we exited the loop without a bilheteNumber, throw the last error
+        if (!bilheteNumber) {
+            throw lastError || new Error('Falha após múltiplas tentativas');
+        }
 
         console.log(`✅ SAVED! Bilhete number: ${bilheteNumber}`);
 
